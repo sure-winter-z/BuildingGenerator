@@ -1,24 +1,28 @@
 # ============================================================================
-# building_generator.rb — CAD→SketchUp 四层建筑自动建模
-# 层高 2800mm / 楼板 120mm / 1F→2F→3F→4F 自动叠放 / 门窗开洞
-#
-# 安装：复制此文件到 SketchUp Plugins 目录
-#   %APPDATA%\SketchUp\SketchUp 20XX\SketchUp\Plugins\
-# 或直接在 SketchUp Ruby 控制台中：load "D:/RUBY/BuildingGenerator/building_generator.rb"
-#
-# 用法：Extensions → Generate Building (DWG→3D) → 多选 DWG 文件 → 完成
+# building_generator.rb — CAD→SketchUp 多层建筑自动建模
+# 层高/楼板厚 可输入调整 / 层数自动匹配 DWG 数量 / 按图名数字叠放
 # ============================================================================
 
 module BuildingGenerator
 
-  FLOOR_HEIGHT   = 2800.0
-  SLAB_THICKNESS = 120.0
-  STEP_HEIGHT    = FLOOR_HEIGHT + SLAB_THICKNESS
+  DEFAULT_WALL_H = 2800.0
+  DEFAULT_SLAB_T = 120.0
   SNAP_TOLERANCE = 5.0
   MIN_WALL_AREA  = 5000.0
   MIN_COL_AREA   = 1000.0
   MAX_COL_AREA   = 250000.0
   Z_AXIS = Geom::Vector3d.new(0, 0, 1)
+
+  @wall_height    = DEFAULT_WALL_H
+  @slab_thickness = DEFAULT_SLAB_T
+
+  class << self
+    attr_accessor :wall_height, :slab_thickness
+  end
+
+  def self.step_height
+    @wall_height + @slab_thickness
+  end
 
   WALL_RE   = /^(wall|a-wall|s-wall|walls|墙体|外墙|内墙|wall-line|wall_full)/i
   COL_RE    = /^(col|column|s-col|柱|a-col)/i
@@ -30,6 +34,11 @@ module BuildingGenerator
   # ========================================================================
   def self.run
     return warn("请在 SketchUp 中运行") unless defined?(Sketchup)
+
+    # —— 参数输入 ——
+    unless get_parameters
+      return
+    end
 
     model = Sketchup.active_model
     model.start_operation("Generate Building", true)
@@ -56,7 +65,7 @@ module BuildingGenerator
 
       stack_floors(comps, model)
       model.commit_operation
-      UI.messagebox("完成! #{comps.length} 层建筑已生成。")
+      UI.messagebox("完成! #{comps.length} 层建筑已生成。\n墙高 #{'%.0f' % @wall_height} mm / 楼板 #{'%.0f' % @slab_thickness} mm")
 
     rescue => e
       model.abort_operation
@@ -65,23 +74,44 @@ module BuildingGenerator
   end
 
   # ========================================================================
-  # 文件选择 & 排序
+  # 参数对话框
+  # ========================================================================
+  def self.get_parameters
+    prompts  = ["墙体高度 (mm)", "楼板厚度 (mm)"]
+    defaults = [@wall_height.to_f, @slab_thickness.to_f]
+    result   = UI.inputbox(prompts, defaults, "建筑参数设置")
+    return false unless result
+    w = result[0].to_f
+    s = result[1].to_f
+    if w <= 0 || s < 0
+      UI.messagebox("墙体高度必须 > 0，楼板厚度必须 >= 0")
+      return false
+    end
+    @wall_height    = w
+    @slab_thickness = s
+    puts "  墙高: #{'%.0f' % w} mm  楼板: #{'%.0f' % s} mm  每层总高: #{'%.0f' % step_height} mm"
+    true
+  end
+
+  # ========================================================================
+  # 文件选择 & 排序（按图名中的数字）
   # ========================================================================
   def self.select_dwg_files
     raw = UI.openpanel("选择 DWG/DXF 文件（可多选）", "", "CAD Files|*.dwg;*.dxf||")
     return [] if !raw || raw.empty?
-    raw.is_a?(Array) ? raw : raw.split(";").map(&:strip).reject(&:empty?)
+    files = raw.is_a?(Array) ? raw : raw.split(";").map(&:strip).reject(&:empty?)
+    if files.empty?
+      UI.messagebox("未选择任何文件")
+    end
+    files
   end
 
   def self.floor_sort_key(path)
-    n = File.basename(path).downcase
-    if    n.match?(/1[f层f]/) then 0
-    elsif n.match?(/2[f层f]/) then 1
-    elsif n.match?(/3[f层f]/) then 2
-    elsif n.match?(/4[f层f]/) then 3
-    elsif n.match?(/屋|顶|roof|5[f层f]/) then 4
-    else 99
-    end
+    name = File.basename(path).downcase
+    return 99999 if name.match?(/屋|顶|roof|屋面|天台/)
+    # 提取文件名中第一个连续数字
+    m = name.match(/(\d+)/)
+    m ? m[1].to_i : 50000
   end
 
   # ========================================================================
@@ -134,24 +164,22 @@ module BuildingGenerator
     copy_edges(wins,  e)
 
     all_faces = all_planar_faces(e)
-    return nil if all_faces.empty?
+    if all_faces.empty?
+      puts "  未能生成面"
+      return inst
+    end
 
-    # 分离墙面 / 开口面
     wall_faces, opening_faces = partition_faces(all_faces, doors, wins, tmp)
     puts "  墙面:#{wall_faces.length} 开口:#{opening_faces.length}"
 
-    # 删除开口面
     opening_faces.each { |f| f.erase! if f.valid? }
 
-    # 删除碎面
     wall_faces.reject! { |f| !f.valid? || f.area < MIN_WALL_AREA }
-    wall_faces.each do |f|
-      f.erase! if f.valid? && f.area < MIN_WALL_AREA
-    end
+    wall_faces.each { |f| f.erase! if f.valid? && f.area < MIN_WALL_AREA }
     wall_faces.select! { |f| f.valid? }
 
     # —— 3D 阶段 ——
-    wall_faces.each { |f| safe_pushpull(f, FLOOR_HEIGHT) }
+    wall_faces.each { |f| safe_pushpull(f, wall_height) }
     extrude_columns_from(e, cols)
     create_slab(e, wall_faces)
 
@@ -228,11 +256,9 @@ module BuildingGenerator
     edges = entities.grep(Sketchup::Edge)
     return [] if edges.length < 3
 
-    # SketchUp 在添加边时可能已自动封面
     auto = entities.grep(Sketchup::Face).select(&:valid?)
     return auto unless auto.empty?
 
-    # 构建邻接图
     adj = Hash.new { |h, k| h[k] = [] }
     edges.each do |e|
       next unless e.valid?
@@ -287,7 +313,6 @@ module BuildingGenerator
         return path
       end
 
-      # 选最左转边
       prev_v = (cur_vtx - path.last.other_vertex(cur_vtx)).normalize
       best_e = nil
       best_ang = 999.0
@@ -340,10 +365,9 @@ module BuildingGenerator
   # 区分墙面 / 开口面
   # ========================================================================
   def self.partition_faces(faces, door_edges, win_edges, source_group)
-    wall_faces     = []
-    opening_faces  = []
+    wall_faces    = []
+    opening_faces = []
 
-    # 构建开口区域 (从门窗边线)
     opening_bboxes = []
     (door_edges + win_edges).each_slice(3) do |group|
       bb = bbox_of(group)
@@ -409,7 +433,7 @@ module BuildingGenerator
     face = entities.add_face(pts_2d)
     return unless face && face.valid?
 
-    face.pushpull(SLAB_THICKNESS)
+    face.pushpull(slab_thickness)
     face.reverse! unless face.normal.samedirection?(Z_AXIS)
   rescue
     nil
@@ -452,7 +476,7 @@ module BuildingGenerator
       begin
         f = entities.add_face(pts)
         next unless f && f.valid?
-        f.pushpull(FLOOR_HEIGHT)
+        f.pushpull(wall_height)
       rescue
         nil
       end
@@ -486,13 +510,13 @@ module BuildingGenerator
   end
 
   # ========================================================================
-  # 叠放
+  # 叠放（层数 = DWG 文件数量）
   # ========================================================================
   def self.stack_floors(comps, model)
     comps.each_with_index do |comp, idx|
       next unless comp && comp.valid?
-      comp.move!([0, 0, idx * STEP_HEIGHT])
-      puts "  F#{idx + 1} → Z = #{'%.0f' % (idx * STEP_HEIGHT)} mm"
+      comp.move!([0, 0, idx * step_height])
+      puts "  F#{idx + 1} → Z = #{'%.0f' % (idx * step_height)} mm"
     end
     model.active_view.zoom_extents
   rescue
